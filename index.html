@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bike Bridge</title>
+<style>
+  :root {
+    --bg: #0f1320; --card: #1a2030; --title: #161c2b; --line: #2a3145;
+    --fg: #e8ecf4; --mut: #8b93a7; --accent: #3b82f6; --ok: #22c55e; --bad: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 560px; margin: 0 auto; padding: 16px; min-height: 100vh;
+  }
+  h1 { font-size: 1.25rem; display: flex; align-items: center; gap: 10px; }
+  h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+  h1 .dot.on { background: var(--ok); }
+  .card { background: var(--card); border-radius: 12px; padding: 14px; margin-top: 12px; }
+  .card h2 { font-size: .8rem; color: var(--mut); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .metric .v { font-size: 2.2rem; font-weight: 650; line-height: 1.1; }
+  .metric .v small { font-size: 1rem; color: var(--mut); font-weight: 400; }
+  .metric .l { color: var(--mut); font-size: .8rem; }
+  .hero .v { font-size: 3.4rem; text-align: center; }
+  .hero .l { text-align: center; }
+  button {
+    font: inherit; color: var(--fg); background: var(--accent); border: 0;
+    border-radius: 10px; padding: 12px 16px; cursor: pointer; font-weight: 600;
+  }
+  button.ghost { background: var(--title); border: 1px solid var(--line); }
+  button.danger { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+  button:disabled { opacity: .4; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label { color: var(--mut); font-size: .8rem; display: block; margin: 8px 0 4px; }
+  input, select {
+    font: inherit; width: 100%; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+  }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: .9rem; }
+  .kv:last-child { border-bottom: 0; }
+  .kv .k { color: var(--mut); }
+  #log { font: .72rem/1.5 ui-monospace, monospace; color: var(--mut); max-height: 130px; overflow-y: auto; }
+  progress { width: 100%; height: 8px; accent-color: var(--accent); }
+  .note { color: var(--mut); font-size: .8rem; margin-top: 8px; }
+  canvas { width: 100%; height: 70px; background: var(--bg); border-radius: 8px; }
+  .unsupported { background: #3a1d1d; border: 1px solid var(--bad); border-radius: 10px; padding: 12px; margin-top: 12px; display: none; }
+</style>
+</head>
+<body>
+  <h1><span class="dot" id="connDot"></span> Bike Bridge <span style="color:var(--mut);font-weight:400;font-size:.85rem" id="devName"></span></h1>
+  <div class="unsupported" id="unsupported">
+    This browser has no Web Bluetooth. Use Chrome/Edge on desktop or Android — or
+    <b>Bluefy</b> on iPhone/iPad (Safari can't do this).
+  </div>
+
+  <div class="card" id="connectCard">
+    <div class="row">
+      <button id="btnConnect">Connect to bridge</button>
+      <button class="ghost" id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+    <div class="note">Looks for a BLE device named like “SB20 Bridge”.</div>
+  </div>
+
+  <div class="card hero metric">
+    <div class="v"><span id="outW">–</span><small> W out</small></div>
+    <div class="l"><span id="srcW">–</span> W in · <span id="corr">×1.000 +0.0</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Live</h2>
+    <div class="grid">
+      <div class="metric"><div class="v" id="cad">–</div><div class="l">cadence rpm</div></div>
+      <div class="metric"><div class="v" id="bal">–</div><div class="l">balance L%</div></div>
+    </div>
+    <div class="kv"><span class="k">Source link</span><span id="srcLink">–</span></div>
+    <div class="kv"><span class="k">Uptime</span><span id="uptime">–</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Correction & identity</h2>
+    <label>Scale (×)</label><input id="cfgScale" type="number" step="0.001" min="0.5" max="2" value="1.000">
+    <label>Offset (W)</label><input id="cfgOffset" type="number" step="0.1" min="-100" max="100" value="0">
+    <label>Source name filter (blank = any power meter)</label><input id="cfgSrc" maxlength="19" placeholder="e.g. ASSIOMA">
+    <label>Broadcast name</label><input id="cfgOut" maxlength="19" value="SB20 Bridge">
+    <div class="row" style="margin-top:10px">
+      <button id="btnApply" disabled>Apply to bridge</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Track recording (IMU)</h2>
+    <div class="row">
+      <select id="recRate" style="width:auto">
+        <option value="13">13 Hz (~10.5 min)</option>
+        <option value="26">26 Hz (~5.2 min)</option>
+        <option value="52" selected>52 Hz (~2.6 min)</option>
+        <option value="104">104 Hz (~1.3 min)</option>
+      </select>
+      <button id="btnRec" disabled>● Record</button>
+      <button class="ghost" id="btnStop" disabled>Stop</button>
+    </div>
+    <div style="margin-top:10px">
+      <progress id="recProg" value="0" max="1"></progress>
+      <div class="kv"><span class="k">State</span><span id="recState">idle</span></div>
+      <div class="kv"><span class="k">Samples</span><span id="recCount">0</span></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" id="btnDownload" disabled>Download CSV</button>
+      <button class="danger" id="btnErase" disabled>Erase</button>
+    </div>
+    <canvas id="preview" width="520" height="70"></canvas>
+  </div>
+
+  <div class="card"><h2>Log</h2><div id="log"></div></div>
+
+<script>
+"use strict";
+// ---- The Bridge GATT contract (mirror of firmware GATT.md / Proto.h; PROTO_VER 1) ----------
+const SVC     = "53423230-0000-4bd9-a4ae-1b4e2c633a1d";
+const CH_STAT = "53423230-0001-4bd9-a4ae-1b4e2c633a1d";
+const CH_CFG  = "53423230-0002-4bd9-a4ae-1b4e2c633a1d";
+const CH_RCTL = "53423230-0003-4bd9-a4ae-1b4e2c633a1d";
+const CH_RDAT = "53423230-0004-4bd9-a4ae-1b4e2c633a1d";
+const SVC_CPS = 0x1818;
+const VER = 1;
+
+const $ = id => document.getElementById(id);
+const log = m => { const d = $("log"); d.innerHTML = `<div>${new Date().toLocaleTimeString()} ${m}</div>` + d.innerHTML; };
+
+if (!navigator.bluetooth) $("unsupported").style.display = "block";
+
+let device = null, server = null, chCfg = null, chRctl = null;
+let dl = null;  // in-flight download state
+
+function setConnected(on) {
+  $("connDot").classList.toggle("on", on);
+  ["btnApply","btnRec","btnStop","btnDownload","btnErase"].forEach(id => $(id).disabled = !on);
+  $("btnDisconnect").disabled = !on;
+  $("btnConnect").disabled = on;
+  if (!on) { $("devName").textContent = ""; }
+}
+
+// ---- Status (20 bytes) ----
+function onStatus(ev) {
+  const d = ev.target.value;
+  if (d.byteLength < 20 || d.getUint8(0) !== VER) return;
+  const flags = d.getUint8(1);
+  const srcW = d.getInt16(2, true), outW = d.getInt16(4, true);
+  const cad = d.getInt16(6, true), bal = d.getInt8(8);
+  const scale = d.getUint16(10, true) / 1000, off = d.getInt16(12, true) / 10;
+  const recN = d.getUint32(14, true), up = d.getUint16(18, true);
+  $("srcW").textContent = srcW >= 0 ? srcW : "–";
+  $("outW").textContent = outW >= 0 ? outW : "–";
+  $("cad").textContent = cad >= 0 ? cad : "–";
+  $("bal").textContent = bal >= 0 ? bal : "–";
+  $("corr").textContent = `×${scale.toFixed(3)} ${off >= 0 ? "+" : ""}${off.toFixed(1)}`;
+  $("srcLink").textContent = (flags & 1) ? "connected" : "searching…";
+  $("uptime").textContent = `${Math.floor(up/60)}m ${up%60}s`;
+  $("recCount").textContent = recN;
+  if (flags & 4) { $("recState").textContent = "recording"; }
+}
+
+// ---- RecCtl state (12 bytes) ----
+let recCapacity = 8192;
+function onRecState(ev) {
+  const d = ev.target.value;
+  if (d.byteLength < 12 || d.getUint8(0) !== VER) return;
+  const st = d.getUint8(1), rate = d.getUint8(2);
+  const n = d.getUint32(4, true); recCapacity = d.getUint32(8, true) || recCapacity;
+  $("recState").textContent = ["idle","recording","downloading"][st] || st;
+  $("recCount").textContent = n;
+  $("recProg").value = n / recCapacity;
+  log(`rec: ${["idle","recording","downloading"][st]} n=${n} rate=${rate}Hz`);
+}
+
+// ---- RecData download ----
+function onRecData(ev) {
+  if (!dl) return;
+  const d = ev.target.value;
+  const t = d.getUint8(1);
+  if (t === 0xFF && d.byteLength >= 12) {
+    dl.rate = d.getUint8(2);
+    dl.total = d.getUint32(4, true);
+    dl.frames = new Map();
+    log(`download: ${dl.total} samples @${dl.rate}Hz`);
+  } else if (t === 0xFD) {
+    const seq = d.getUint16(2, true), n = d.getUint8(4);
+    const bytes = new Uint8Array(d.buffer, d.byteOffset + 6, n * 12);
+    dl.frames.set(seq, new Uint8Array(bytes));  // copy
+  } else if (t === 0xFE && d.byteLength >= 6) {
+    finishDownload(d.getUint32(2, true));
+  }
+}
+
+function crc32(bytes) {
+  let c, crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    c = (crc ^ bytes[i]) & 0xFF;
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & (-(c & 1)));
+    crc = (crc >>> 8) ^ c;
+  }
+  return (~crc) >>> 0;
+}
+
+function finishDownload(devCrc) {
+  const seqs = [...dl.frames.keys()].sort((a, b) => a - b);
+  let len = 0; seqs.forEach(s => len += dl.frames.get(s).length);
+  const blob = new Uint8Array(len);
+  let o = 0; seqs.forEach(s => { blob.set(dl.frames.get(s), o); o += dl.frames.get(s).length; });
+  const ours = crc32(blob);
+  const n = len / 12;
+  log(`download done: ${n} samples, CRC ${ours === devCrc ? "OK" : "MISMATCH"}`);
+  // CSV: t, ax..gz in physical units (±16 g: 0.488 mg/LSB · ±2000 dps: 70 mdps/LSB)
+  const v = new DataView(blob.buffer);
+  let csv = "t_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n";
+  const mags = [];
+  for (let i = 0; i < n; i++) {
+    const t = (i / dl.rate).toFixed(4);
+    const s = [];
+    for (let a = 0; a < 6; a++) {
+      const rawv = v.getInt16(i * 12 + a * 2, true);
+      s.push(a < 3 ? (rawv * 0.000488).toFixed(4) : (rawv * 0.070).toFixed(2));
+    }
+    if (i % Math.max(1, Math.floor(n / 520)) === 0)
+      mags.push(Math.hypot(+s[0], +s[1], +s[2]));
+    csv += `${t},${s.join(",")}\n`;
+  }
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = `imu-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  drawPreview(mags);
+  dl = null;
+}
+
+function drawPreview(mags) {
+  const cv = $("preview"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!mags.length) return;
+  const max = Math.max(2, ...mags);
+  ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  mags.forEach((m, i) => {
+    const x = i / (mags.length - 1) * cv.width;
+    const y = cv.height - (m / max) * (cv.height - 6) - 3;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// ---- Config ----
+function packConfig() {
+  const b = new Uint8Array(44);
+  const v = new DataView(b.buffer);
+  b[0] = VER; b[1] = 0;  // BLE routing only (ANT bits arrive with the S340 build)
+  v.setUint16(2, Math.round(parseFloat($("cfgScale").value || "1") * 1000), true);
+  v.setInt16(4, Math.round(parseFloat($("cfgOffset").value || "0") * 10), true);
+  new TextEncoder().encodeInto($("cfgSrc").value.slice(0, 19), b.subarray(6, 25));
+  new TextEncoder().encodeInto($("cfgOut").value.slice(0, 19), b.subarray(25, 44));
+  return b;
+}
+function loadConfigView(d) {
+  if (d.byteLength < 44 || d.getUint8(0) !== VER) return;
+  $("cfgScale").value = (d.getUint16(2, true) / 1000).toFixed(3);
+  $("cfgOffset").value = (d.getInt16(4, true) / 10).toFixed(1);
+  const dec = b => new TextDecoder().decode(b).replace(/\0+$/, "");
+  $("cfgSrc").value = dec(new Uint8Array(d.buffer, d.byteOffset + 6, 19));
+  $("cfgOut").value = dec(new Uint8Array(d.buffer, d.byteOffset + 25, 19));
+}
+
+// ---- wiring ----
+$("btnConnect").onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "SB20" }],
+      optionalServices: [SVC, SVC_CPS],
+    });
+    device.addEventListener("gattserverdisconnected", () => { setConnected(false); log("disconnected"); });
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    const chStat = await svc.getCharacteristic(CH_STAT);
+    chCfg = await svc.getCharacteristic(CH_CFG);
+    chRctl = await svc.getCharacteristic(CH_RCTL);
+    const chRdat = await svc.getCharacteristic(CH_RDAT);
+    chStat.addEventListener("characteristicvaluechanged", onStatus);
+    chRctl.addEventListener("characteristicvaluechanged", onRecState);
+    chRdat.addEventListener("characteristicvaluechanged", onRecData);
+    await chStat.startNotifications();
+    await chRctl.startNotifications();
+    await chRdat.startNotifications();
+    loadConfigView(await chCfg.readValue());
+    $("devName").textContent = device.name || "";
+    setConnected(true);
+    log(`connected to ${device.name}`);
+  } catch (e) { log(`connect failed: ${e.message}`); }
+};
+$("btnDisconnect").onclick = () => device?.gatt?.disconnect();
+$("btnApply").onclick = async () => {
+  try {
+    await chCfg.writeValueWithResponse(packConfig());
+    loadConfigView(await chCfg.readValue());  // read back what stuck
+    log("config applied");
+  } catch (e) { log(`config failed: ${e.message}`); }
+};
+$("btnRec").onclick = async () => {
+  await chRctl.writeValueWithResponse(new Uint8Array([VER, 4, +$("recRate").value]));
+  await chRctl.writeValueWithResponse(new Uint8Array([VER, 1]));
+};
+$("btnStop").onclick = () => chRctl.writeValueWithResponse(new Uint8Array([VER, 0]));
+$("btnErase").onclick = () => chRctl.writeValueWithResponse(new Uint8Array([VER, 2]));
+$("btnDownload").onclick = async () => {
+  dl = { frames: new Map(), total: 0, rate: 52 };
+  await chRctl.writeValueWithResponse(new Uint8Array([VER, 3]));
+};
+</script>
+</body>
+</html>
