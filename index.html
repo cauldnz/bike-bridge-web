@@ -83,6 +83,7 @@
     <h2>Correction & identity</h2>
     <label>Scale (×)</label><input id="cfgScale" type="number" step="0.001" min="0.5" max="2" value="1.000">
     <label>Offset (W)</label><input id="cfgOffset" type="number" step="0.1" min="-100" max="100" value="0">
+    <label style="display:flex;align-items:center;gap:8px;font-weight:400"><input id="cfgSingle" type="checkbox" style="width:auto"> Single-sided ×2 (double an R-only crank)</label>
     <label>Source name filter (blank = any power meter)</label><input id="cfgSrc" maxlength="19" placeholder="e.g. ASSIOMA">
     <label>Broadcast name</label><input id="cfgOut" maxlength="19" value="SB20 Bridge">
     <div class="row" style="margin-top:10px">
@@ -256,7 +257,7 @@ function drawPreview(mags) {
 function packConfig() {
   const b = new Uint8Array(44);
   const v = new DataView(b.buffer);
-  b[0] = VER; b[1] = 0;  // BLE routing only (ANT bits arrive with the S340 build)
+  b[0] = VER; b[1] = ($("cfgSingle").checked ? 4 : 0);  // b2 single-sided (ANT bits arrive with S340)
   v.setUint16(2, Math.round(parseFloat($("cfgScale").value || "1") * 1000), true);
   v.setInt16(4, Math.round(parseFloat($("cfgOffset").value || "0") * 10), true);
   new TextEncoder().encodeInto($("cfgSrc").value.slice(0, 19), b.subarray(6, 25));
@@ -267,6 +268,7 @@ function loadConfigView(d) {
   if (d.byteLength < 44 || d.getUint8(0) !== VER) return;
   $("cfgScale").value = (d.getUint16(2, true) / 1000).toFixed(3);
   $("cfgOffset").value = (d.getInt16(4, true) / 10).toFixed(1);
+  $("cfgSingle").checked = (d.getUint8(1) & 4) !== 0;
   const dec = b => new TextDecoder().decode(b).replace(/\0+$/, "");
   $("cfgSrc").value = dec(new Uint8Array(d.buffer, d.byteOffset + 6, 19));
   $("cfgOut").value = dec(new Uint8Array(d.buffer, d.byteOffset + 25, 19));
