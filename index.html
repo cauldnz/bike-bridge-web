@@ -85,6 +85,8 @@
     <label>Offset (W)</label><input id="cfgOffset" type="number" step="0.1" min="-100" max="100" value="0">
     <label style="display:flex;align-items:center;gap:8px;font-weight:400"><input id="cfgSingle" type="checkbox" style="width:auto"> Single-sided ×2 (double an R-only crank)</label>
     <label>Source name filter (blank = any power meter)</label><input id="cfgSrc" maxlength="19" placeholder="e.g. ASSIOMA">
+    <div class="note" style="margin-top:6px">Nearby (tap to use as source):</div>
+    <div id="scanList" style="display:flex;flex-direction:column;gap:4px;margin-top:4px"><span class="note">scanning…</span></div>
     <label>Broadcast name</label><input id="cfgOut" maxlength="19" value="SB20 Bridge">
     <div class="row" style="margin-top:10px">
       <button id="btnApply" disabled>Apply to bridge</button>
@@ -145,6 +147,7 @@ const CH_RCTL = "53423230-0003-4bd9-a4ae-1b4e2c633a1d";
 const CH_RDAT = "53423230-0004-4bd9-a4ae-1b4e2c633a1d";
 const CH_CURV = "53423230-0005-4bd9-a4ae-1b4e2c633a1d";
 const CH_CAL  = "53423230-0006-4bd9-a4ae-1b4e2c633a1d";
+const CH_SCAN = "53423230-0007-4bd9-a4ae-1b4e2c633a1d";
 const SVC_CPS = 0x1818;
 const VER = 1;
 
@@ -162,6 +165,26 @@ function setConnected(on) {
   $("btnDisconnect").disabled = !on;
   $("btnConnect").disabled = on;
   if (!on) { $("devName").textContent = ""; }
+}
+
+// ---- ScanList: nearby meters/trainers (21-byte slots) ----
+function onScanList(ev) {
+  const d = ev.target.value;
+  if (d.byteLength < 2 || d.getUint8(0) !== VER) return;
+  const n = d.getUint8(1), el = $("scanList");
+  el.innerHTML = "";
+  if (!n) { el.innerHTML = '<span class="note">no meters seen yet…</span>'; return; }
+  for (let i = 0; i < n; i++) {
+    const o = 2 + i * 21;
+    const name = new TextDecoder().decode(new Uint8Array(d.buffer, d.byteOffset + o, 19)).replace(/\0+$/, "");
+    const rssi = d.getInt8(o + 19), flags = d.getUint8(o + 20);
+    const kind = (flags & 2) ? "trainer" : (flags & 4) ? "crank" : "meter";
+    const row = document.createElement("button");
+    row.className = "net";
+    row.innerHTML = `<span class="nm">${name}</span><span class="lk">${kind}</span><span class="sig" title="${rssi} dBm">${rssi}</span>`;
+    row.onclick = () => { $("cfgSrc").value = name; };
+    el.appendChild(row);
+  }
 }
 
 // ---- Calibration state (16 bytes) ----
@@ -344,6 +367,12 @@ $("btnConnect").onclick = async () => {
       chCal.addEventListener("characteristicvaluechanged", onCalState);
       await chCal.startNotifications();
     } catch (e) { chCal = null; log("calibration not available (older firmware)"); }
+    try {  // ScanList (source picker) — also newer firmware
+      const chScan = await svc.getCharacteristic(CH_SCAN);
+      chScan.addEventListener("characteristicvaluechanged", onScanList);
+      await chScan.startNotifications();
+      onScanList({ target: { value: await chScan.readValue() } });  // seed with current list
+    } catch (e) { $("scanList").innerHTML = ""; }
     loadConfigView(await chCfg.readValue());
     $("devName").textContent = device.name || "";
     setConnected(true);
