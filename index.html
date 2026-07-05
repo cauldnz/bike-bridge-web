@@ -112,6 +112,35 @@
   </div>
 
   <div class="card">
+    <h2>Workout &amp; erg (drive a trainer)</h2>
+    <div class="note" style="margin-bottom:8px">Connects to an FTMS trainer as a third link and holds the workout's target power (erg). Pick a trainer, load a preset, press Start.</div>
+    <label>Trainer name (blank = drop)</label><input id="wkTrainer" maxlength="19" placeholder="e.g. SB20-FTMS-Server">
+    <div class="note" style="margin-top:6px">Nearby trainers (tap to use):</div>
+    <div id="trainerList" style="display:flex;flex-direction:column;gap:4px;margin-top:4px"><span class="note">scanning…</span></div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" id="btnWkSetTrainer" disabled>Set trainer</button>
+    </div>
+    <label>Workout</label>
+    <select id="wkPreset"></select>
+    <div class="row" style="margin-top:10px">
+      <button id="btnWkLoad" disabled>Load</button>
+      <button id="btnWkStart" disabled>Start</button>
+      <button class="ghost" id="btnWkPause" disabled>Pause</button>
+      <button class="danger" id="btnWkStop" disabled>Stop</button>
+    </div>
+    <div class="grid" style="margin-top:12px">
+      <div class="metric"><div class="v" id="wkTarget">–<small> W target</small></div><div class="l" id="wkSeg">no workout</div></div>
+      <div class="metric"><div class="v" id="wkElapsed">–</div><div class="l">elapsed</div></div>
+    </div>
+    <div class="row" style="margin-top:10px;justify-content:center;gap:14px">
+      <button class="ghost" id="btnBiasDown" disabled style="font-size:1.2rem;padding:8px 18px">– 10 W</button>
+      <div class="metric" style="text-align:center;min-width:70px"><div class="v" id="wkBias" style="font-size:1.4rem">0</div><div class="l">shifter bias</div></div>
+      <button class="ghost" id="btnBiasUp" disabled style="font-size:1.2rem;padding:8px 18px">+ 10 W</button>
+    </div>
+    <div class="kv" style="margin-top:8px"><span class="k">Trainer link</span><span id="wkLink">–</span></div>
+  </div>
+
+  <div class="card">
     <h2>Track recording (IMU)</h2>
     <div class="row">
       <select id="recRate" style="width:auto">
@@ -148,20 +177,29 @@ const CH_RDAT = "53423230-0004-4bd9-a4ae-1b4e2c633a1d";
 const CH_CURV = "53423230-0005-4bd9-a4ae-1b4e2c633a1d";
 const CH_CAL  = "53423230-0006-4bd9-a4ae-1b4e2c633a1d";
 const CH_SCAN = "53423230-0007-4bd9-a4ae-1b4e2c633a1d";
+const CH_WK   = "53423230-0008-4bd9-a4ae-1b4e2c633a1d";
 const SVC_CPS = 0x1818;
 const VER = 1;
+// Preset labels mirror firmware WorkoutPresets.h (index-addressed, no GATT enumeration).
+const PRESETS = ["4×8 Threshold", "Sweet Spot 3×12", "VO2 5×3", "Endurance 45"];
 
 const $ = id => document.getElementById(id);
 const log = m => { const d = $("log"); d.innerHTML = `<div>${new Date().toLocaleTimeString()} ${m}</div>` + d.innerHTML; };
 
 if (!navigator.bluetooth) $("unsupported").style.display = "block";
 
-let device = null, server = null, chCfg = null, chRctl = null, chCal = null;
+let device = null, server = null, chCfg = null, chRctl = null, chCal = null, chWk = null;
 let dl = null;  // in-flight download state
+
+// Populate the preset dropdown once (labels mirror the firmware).
+PRESETS.forEach((p, i) => { const o = document.createElement("option"); o.value = i; o.textContent = p; $("wkPreset").appendChild(o); });
 
 function setConnected(on) {
   $("connDot").classList.toggle("on", on);
   ["btnApply","btnRec","btnStop","btnDownload","btnErase","btnCalStart"].forEach(id => $(id).disabled = !on);
+  // Workout: Set-trainer/Load/Start available on connect; Pause/Stop/bias are state-driven (onWkState).
+  ["btnWkSetTrainer","btnWkLoad","btnWkStart"].forEach(id => $(id).disabled = !on);
+  if (!on) ["btnWkPause","btnWkStop","btnBiasDown","btnBiasUp"].forEach(id => $(id).disabled = true);
   $("btnDisconnect").disabled = !on;
   $("btnConnect").disabled = on;
   if (!on) { $("devName").textContent = ""; }
@@ -171,20 +209,27 @@ function setConnected(on) {
 function onScanList(ev) {
   const d = ev.target.value;
   if (d.byteLength < 2 || d.getUint8(0) !== VER) return;
-  const n = d.getUint8(1), el = $("scanList");
-  el.innerHTML = "";
-  if (!n) { el.innerHTML = '<span class="note">no meters seen yet…</span>'; return; }
+  const n = d.getUint8(1), el = $("scanList"), tel = $("trainerList");
+  el.innerHTML = ""; tel.innerHTML = "";
+  if (!n) { el.innerHTML = '<span class="note">no meters seen yet…</span>'; }
+  let nTrainers = 0;
   for (let i = 0; i < n; i++) {
     const o = 2 + i * 21;
     const name = new TextDecoder().decode(new Uint8Array(d.buffer, d.byteOffset + o, 19)).replace(/\0+$/, "");
     const rssi = d.getInt8(o + 19), flags = d.getUint8(o + 20);
-    const kind = (flags & 2) ? "trainer" : (flags & 4) ? "crank" : "meter";
-    const row = document.createElement("button");
-    row.className = "net";
-    row.innerHTML = `<span class="nm">${name}</span><span class="lk">${kind}</span><span class="sig" title="${rssi} dBm">${rssi}</span>`;
-    row.onclick = () => { $("cfgSrc").value = name; };
-    el.appendChild(row);
+    const isTrainer = (flags & 2) !== 0;
+    const kind = isTrainer ? "trainer" : (flags & 4) ? "crank" : "meter";
+    const mkRow = target => {
+      const row = document.createElement("button");
+      row.className = "net";
+      row.innerHTML = `<span class="nm">${name}</span><span class="lk">${kind}</span><span class="sig" title="${rssi} dBm">${rssi}</span>`;
+      row.onclick = () => { $(target).value = name; };
+      return row;
+    };
+    el.appendChild(mkRow("cfgSrc"));                       // any device is a candidate source
+    if (isTrainer) { tel.appendChild(mkRow("wkTrainer")); nTrainers++; }  // trainers also list for erg
   }
+  if (!nTrainers) tel.innerHTML = '<span class="note">no trainers seen yet…</span>';
 }
 
 // ---- Calibration state (16 bytes) ----
@@ -210,6 +255,32 @@ function onCalState(ev) {
     bar.title = `${n} pairs`;
     cov.appendChild(bar);
   }
+}
+
+// ---- Workout + erg state (18 bytes) ----
+function onWkState(ev) {
+  const d = ev.target.value;
+  if (d.byteLength < 18 || d.getUint8(0) !== VER) return;
+  const flags = d.getUint8(1);
+  const target = d.getInt16(2, true), segIdx = d.getUint8(4), nSeg = d.getUint8(5);
+  const segRemain = d.getUint16(6, true), elapsed = d.getUint16(10, true);
+  const bias = d.getInt16(12, true);
+  const loaded = !!(flags & 1), running = !!(flags & 2), paused = !!(flags & 4);
+  const ergConn = !!(flags & 8), ergCtl = !!(flags & 16);
+  const mmss = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+  $("wkTarget").innerHTML = running ? `${target}<small> W target</small>` : `–<small> W target</small>`;
+  $("wkSeg").textContent = loaded
+    ? (running ? `segment ${segIdx+1}/${nSeg} · ${mmss(segRemain)} left` : `loaded · ${nSeg} segments`)
+    : "no workout";
+  $("wkElapsed").textContent = running ? mmss(elapsed) : "–";
+  $("wkBias").textContent = `${bias>=0?"+":""}${bias}`;
+  $("wkLink").textContent = ergConn ? (ergCtl ? "controlling" : "connected") : "searching…";
+  // state-driven buttons
+  $("btnWkStart").disabled = !loaded || running;
+  $("btnWkPause").disabled = !running;
+  $("btnWkPause").textContent = paused ? "Resume" : "Pause";
+  $("btnWkStop").disabled = !loaded;
+  $("btnBiasDown").disabled = $("btnBiasUp").disabled = !running || paused;
 }
 
 // ---- Status (20 bytes) ----
@@ -373,6 +444,11 @@ $("btnConnect").onclick = async () => {
       await chScan.startNotifications();
       onScanList({ target: { value: await chScan.readValue() } });  // seed with current list
     } catch (e) { $("scanList").innerHTML = ""; }
+    try {  // Workout + erg — P4 firmware
+      chWk = await svc.getCharacteristic(CH_WK);
+      chWk.addEventListener("characteristicvaluechanged", onWkState);
+      await chWk.startNotifications();
+    } catch (e) { chWk = null; log("workout/erg not available (older firmware)"); }
     loadConfigView(await chCfg.readValue());
     $("devName").textContent = device.name || "";
     setConnected(true);
@@ -411,6 +487,20 @@ $("btnCalSave").onclick = async () => {
   await chCal.writeValueWithResponse(new Uint8Array([VER, 3]));   // save fit -> correction curve
   log("calibration saved — correction curve applied");
 };
+// ---- Workout + erg ----  (WkCmd: 1 setTrainer · 2 load · 3 start · 4 pause · 5 resume · 6 stop · 8 bias)
+const wkWrite = bytes => chWk?.writeValueWithResponse(new Uint8Array(bytes));
+$("btnWkSetTrainer").onclick = async () => {
+  const name = $("wkTrainer").value.slice(0, 19);
+  const b = new Uint8Array(2 + name.length); b[0] = VER; b[1] = 1;
+  new TextEncoder().encodeInto(name, b.subarray(2));
+  await wkWrite(b); log(name ? `trainer set to '${name}'` : "trainer cleared");
+};
+$("btnWkLoad").onclick = async () => { await wkWrite([VER, 2, +$("wkPreset").value]); log(`loaded '${PRESETS[+$("wkPreset").value]}'`); };
+$("btnWkStart").onclick = () => wkWrite([VER, 3]);
+$("btnWkPause").onclick = () => wkWrite([VER, $("btnWkPause").textContent === "Resume" ? 5 : 4]);
+$("btnWkStop").onclick  = () => wkWrite([VER, 6]);
+$("btnBiasDown").onclick = () => wkWrite([VER, 8, 0xF6]);  // -10 as i8 (256-10)
+$("btnBiasUp").onclick   = () => wkWrite([VER, 8, 10]);    // +10
 </script>
 </body>
 </html>
