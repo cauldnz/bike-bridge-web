@@ -92,6 +92,24 @@
   </div>
 
   <div class="card">
+    <h2>Calibrate against a reference</h2>
+    <div class="note" style="margin-bottom:8px">Reads your source (DUT) + a reference meter at once, then fits a correction curve so the source reads like the reference. Ride a spread of powers.</div>
+    <label>Reference meter name</label><input id="calRef" maxlength="19" placeholder="e.g. ASSIOMA">
+    <div class="row" style="margin-top:10px">
+      <button id="btnCalStart" disabled>Start</button>
+      <button class="ghost" id="btnCalStop" disabled>Cancel</button>
+      <button id="btnCalSave" disabled>Save fit</button>
+    </div>
+    <div style="margin-top:10px">
+      <div class="kv"><span class="k">State</span><span id="calState">idle</span></div>
+      <div class="kv"><span class="k">Pairs</span><span id="calPairs">0 / 30</span></div>
+      <div class="kv"><span class="k">Residual</span><span id="calResid">–</span></div>
+      <div class="note" style="margin-top:6px">Coverage across the power range (spread these):</div>
+      <div id="calCoverage" style="display:flex;gap:4px;margin-top:6px;height:36px;align-items:flex-end"></div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Track recording (IMU)</h2>
     <div class="row">
       <select id="recRate" style="width:auto">
@@ -125,6 +143,8 @@ const CH_STAT = "53423230-0001-4bd9-a4ae-1b4e2c633a1d";
 const CH_CFG  = "53423230-0002-4bd9-a4ae-1b4e2c633a1d";
 const CH_RCTL = "53423230-0003-4bd9-a4ae-1b4e2c633a1d";
 const CH_RDAT = "53423230-0004-4bd9-a4ae-1b4e2c633a1d";
+const CH_CURV = "53423230-0005-4bd9-a4ae-1b4e2c633a1d";
+const CH_CAL  = "53423230-0006-4bd9-a4ae-1b4e2c633a1d";
 const SVC_CPS = 0x1818;
 const VER = 1;
 
@@ -133,15 +153,40 @@ const log = m => { const d = $("log"); d.innerHTML = `<div>${new Date().toLocale
 
 if (!navigator.bluetooth) $("unsupported").style.display = "block";
 
-let device = null, server = null, chCfg = null, chRctl = null;
+let device = null, server = null, chCfg = null, chRctl = null, chCal = null;
 let dl = null;  // in-flight download state
 
 function setConnected(on) {
   $("connDot").classList.toggle("on", on);
-  ["btnApply","btnRec","btnStop","btnDownload","btnErase"].forEach(id => $(id).disabled = !on);
+  ["btnApply","btnRec","btnStop","btnDownload","btnErase","btnCalStart"].forEach(id => $(id).disabled = !on);
   $("btnDisconnect").disabled = !on;
   $("btnConnect").disabled = on;
   if (!on) { $("devName").textContent = ""; }
+}
+
+// ---- Calibration state (16 bytes) ----
+function onCalState(ev) {
+  const d = ev.target.value;
+  if (d.byteLength < 16 || d.getUint8(0) !== VER) return;
+  const st = d.getUint8(1);                       // 0 idle · 1 collecting · 2 fitted
+  const pairs = d.getUint16(3, true), minP = d.getUint16(5, true);
+  const resid = d.getInt16(7, true) / 10, enough = d.getUint8(15);
+  $("calState").textContent = ["idle","collecting","fitted"][st] || st;
+  $("calPairs").textContent = `${pairs} / ${minP}`;
+  $("calResid").textContent = st === 2 ? `±${resid.toFixed(1)} W` : "–";
+  const collecting = st === 1, fitted = st === 2;
+  $("btnCalStop").disabled = !collecting && !fitted;
+  $("btnCalSave").disabled = !(enough || fitted);
+  $("btnCalStart").disabled = collecting || fitted;
+  // coverage bars (6 power bins)
+  const cov = $("calCoverage"); cov.innerHTML = "";
+  for (let i = 0; i < 6; i++) {
+    const n = d.getUint8(9 + i);
+    const bar = document.createElement("div");
+    bar.style.cssText = `flex:1;background:${n>=5?'var(--ok)':'var(--accent)'};border-radius:3px;height:${Math.min(100,n*12)}%;min-height:3px;opacity:${n?1:.25}`;
+    bar.title = `${n} pairs`;
+    cov.appendChild(bar);
+  }
 }
 
 // ---- Status (20 bytes) ----
@@ -294,6 +339,11 @@ $("btnConnect").onclick = async () => {
     await chStat.startNotifications();
     await chRctl.startNotifications();
     await chRdat.startNotifications();
+    try {  // Calibrate is a newer characteristic — tolerate older firmware without it
+      chCal = await svc.getCharacteristic(CH_CAL);
+      chCal.addEventListener("characteristicvaluechanged", onCalState);
+      await chCal.startNotifications();
+    } catch (e) { chCal = null; log("calibration not available (older firmware)"); }
     loadConfigView(await chCfg.readValue());
     $("devName").textContent = device.name || "";
     setConnected(true);
@@ -317,6 +367,20 @@ $("btnErase").onclick = () => chRctl.writeValueWithResponse(new Uint8Array([VER,
 $("btnDownload").onclick = async () => {
   dl = { frames: new Map(), total: 0, rate: 52 };
   await chRctl.writeValueWithResponse(new Uint8Array([VER, 3]));
+};
+// ---- Calibration wizard ----
+$("btnCalStart").onclick = async () => {
+  const ref = $("calRef").value.slice(0, 19);
+  const b = new Uint8Array(2 + ref.length);
+  b[0] = VER; b[1] = 1;  // start
+  new TextEncoder().encodeInto(ref, b.subarray(2));
+  await chCal.writeValueWithResponse(b);
+  log(`calibration started (reference '${ref}')`);
+};
+$("btnCalStop").onclick = () => chCal.writeValueWithResponse(new Uint8Array([VER, 2]));   // cancel
+$("btnCalSave").onclick = async () => {
+  await chCal.writeValueWithResponse(new Uint8Array([VER, 3]));   // save fit -> correction curve
+  log("calibration saved — correction curve applied");
 };
 </script>
 </body>
