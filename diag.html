@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bike Bridge — Bluefy diagnostics</title>
+<style>
+  body { font: 15px/1.45 -apple-system, system-ui, sans-serif; margin: 0; padding: 16px;
+         background:#111; color:#eee; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .row { padding: 8px 10px; margin: 6px 0; border-radius: 8px; background:#1c1c1c;
+         border-left: 4px solid #555; word-break: break-word; }
+  .ok   { border-left-color:#2ecc71; }
+  .bad  { border-left-color:#e74c3c; }
+  .warn { border-left-color:#f39c12; }
+  .k { color:#8ab4f8; }
+  button { font-size:16px; padding:12px 18px; margin:10px 0; width:100%;
+           border-radius:8px; border:0; background:#2d6cdf; color:#fff; }
+  pre { white-space: pre-wrap; background:#000; padding:10px; border-radius:6px; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>Bike Bridge — Bluefy diagnostics</h1>
+<div id="out"></div>
+<button id="btn">TAP: try requestDevice (namePrefix "SB20")</button>
+<button id="btn2">TAP: try requestDevice (acceptAllDevices)</button>
+<pre id="err">errors: (none yet)</pre>
+
+<script>
+// Deliberately a CLASSIC script (no module, no imports) so it cannot fail the way the SPA did.
+var out = document.getElementById('out');
+var errBox = document.getElementById('err');
+var errors = [];
+function note(label, value, cls) {
+  var d = document.createElement('div');
+  d.className = 'row ' + (cls || '');
+  d.innerHTML = '<span class="k">' + label + ':</span> ' + value;
+  out.appendChild(d);
+}
+function showErrors() { errBox.textContent = 'errors:\n' + (errors.length ? errors.join('\n') : '(none)'); }
+window.addEventListener('error', function (e) {
+  errors.push('window.error: ' + (e.message || e) + ' @ ' + (e.filename || '?') + ':' + (e.lineno || '?'));
+  showErrors();
+});
+window.addEventListener('unhandledrejection', function (e) {
+  errors.push('unhandledrejection: ' + (e.reason && (e.reason.message || e.reason)));
+  showErrors();
+});
+
+note('userAgent', navigator.userAgent);
+note('secure context', String(window.isSecureContext), window.isSecureContext ? 'ok' : 'bad');
+note('origin', location.origin);
+
+var hasBT = (typeof navigator.bluetooth !== 'undefined');
+note('navigator.bluetooth', hasBT ? 'PRESENT' : 'MISSING', hasBT ? 'ok' : 'bad');
+if (hasBT) {
+  note('requestDevice fn', typeof navigator.bluetooth.requestDevice,
+       typeof navigator.bluetooth.requestDevice === 'function' ? 'ok' : 'bad');
+  note('getAvailability fn', typeof navigator.bluetooth.getAvailability);
+  if (typeof navigator.bluetooth.getAvailability === 'function') {
+    navigator.bluetooth.getAvailability().then(function (a) {
+      note('getAvailability()', String(a), a ? 'ok' : 'warn');
+    }).catch(function (e) { note('getAvailability() threw', e.message, 'bad'); });
+  }
+}
+
+// Does this browser support ES modules + dynamic import of the sibling file the SPA needs?
+var modScript = document.createElement('script');
+modScript.type = 'module';
+modScript.textContent =
+  "window.__moduleRan = true;" +
+  "import('./bridge-codec.js')" +
+  "  .then(function(m){ window.__codecOk = Object.keys(m).length; })" +
+  "  .catch(function(e){ window.__codecErr = e && (e.message || String(e)); });";
+document.head.appendChild(modScript);
+
+setTimeout(function () {
+  note('ES module executed', window.__moduleRan ? 'YES' : 'NO', window.__moduleRan ? 'ok' : 'bad');
+  if (window.__codecOk !== undefined) {
+    note('import ./bridge-codec.js', 'OK (' + window.__codecOk + ' exports)', 'ok');
+  } else if (window.__codecErr !== undefined) {
+    note('import ./bridge-codec.js', 'FAILED — ' + window.__codecErr, 'bad');
+  } else {
+    note('import ./bridge-codec.js', 'no result yet (still pending?)', 'warn');
+  }
+  showErrors();
+}, 2500);
+
+function tryRequest(opts, label) {
+  note(label, 'tapped — waiting for picker…', 'warn');
+  if (!hasBT) { note(label, 'ABORT: navigator.bluetooth missing', 'bad'); return; }
+  try {
+    navigator.bluetooth.requestDevice(opts).then(function (d) {
+      note(label, 'PICKED: ' + (d.name || '(no name)') + ' id=' + d.id, 'ok');
+    }).catch(function (e) {
+      note(label, 'REJECTED: ' + e.name + ' — ' + e.message, 'bad');
+    });
+  } catch (e) {
+    note(label, 'THREW SYNCHRONOUSLY: ' + e.name + ' — ' + e.message, 'bad');
+  }
+}
+document.getElementById('btn').onclick = function () {
+  tryRequest({ filters: [{ namePrefix: 'SB20' }],
+               optionalServices: ['53423230-0000-4bd9-a4ae-1b4e2c633a1d', 0x1818] },
+             'filtered requestDevice');
+};
+document.getElementById('btn2').onclick = function () {
+  tryRequest({ acceptAllDevices: true,
+               optionalServices: ['53423230-0000-4bd9-a4ae-1b4e2c633a1d', 0x1818] },
+             'acceptAll requestDevice');
+};
+showErrors();
+</script>
+</body>
+</html>
