@@ -80,15 +80,42 @@
 
   <div class="card">
     <h2>Correction & identity</h2>
-    <label>Scale (×)</label><input id="cfgScale" type="number" step="0.001" min="0.5" max="2" value="1.000">
-    <label>Offset (W)</label><input id="cfgOffset" type="number" step="0.1" min="-100" max="100" value="0">
+    <label>Broadcast mode</label>
+    <select id="cfgMode">
+      <option value="corrector">Corrector — broadcast under our own name</option>
+      <option value="spoof">Spoof Stages crank — drive an SB20</option>
+    </select>
+    <div class="note" id="cfgModeHelp"></div>
+    <div id="cfgRadioRow" style="display:none">
+      <label>Spoof radio</label>
+      <select id="cfgRadio">
+        <option value="ble">Bluetooth (BLE) — pair the SB20 to us as its crank</option>
+        <option value="ant" disabled>ANT+ — the SB20's internal radio (needs the S340 SoftDevice — coming)</option>
+      </select>
+    </div>
+    <div id="cfgScalarRow">
+      <label>Scale (×)</label><input id="cfgScale" type="number" step="0.001" min="0.5" max="2" value="1.000">
+      <label>Offset (W)</label><input id="cfgOffset" type="number" step="0.1" min="-100" max="100" value="0">
+    </div>
+    <div class="note" id="cfgCurveNote" style="display:none">Correction on this device is set by the Calibrate wizard below (a fitted curve), not a scale/offset.</div>
     <label style="display:flex;align-items:center;gap:8px;font-weight:400"><input id="cfgSingle" type="checkbox" style="width:auto"> Single-sided ×2 (double an R-only crank)</label>
     <label>Source name filter (blank = any power meter)</label><input id="cfgSrc" maxlength="19" placeholder="e.g. ASSIOMA">
     <div class="note" style="margin-top:6px">Nearby (tap to use as source):</div>
     <div id="scanList" style="display:flex;flex-direction:column;gap:4px;margin-top:4px"><span class="note">scanning…</span></div>
     <label>Broadcast name</label><input id="cfgOut" maxlength="19" value="SB20 Bridge">
+    <div class="note" id="cfgRebootHint" style="display:none;color:var(--accent)">Mode change — Apply, then reboot the device to re-advertise the new identity.</div>
     <div class="row" style="margin-top:10px">
       <button id="btnApply" disabled>Apply to bridge</button>
+    </div>
+  </div>
+
+  <div class="card" id="buttonsCard">
+    <h2>SB20 handlebar buttons</h2>
+    <div class="note" style="margin-bottom:8px">Read the SB20's own shifter buttons and re-broadcast each press as the action you pick &mdash; an OpenBikeControl id (to a training app) or a local erg nudge. Applies live.</div>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:400"><input id="btnSink" type="checkbox" style="width:auto"> Sink SB20 buttons (read the shifter)</label>
+    <div id="btnRows" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnButtonsApply" disabled>Apply to bridge</button>
     </div>
   </div>
 
@@ -174,15 +201,45 @@
     <canvas id="preview" width="520" height="70"></canvas>
   </div>
 
+  <!-- #10 A/B meter compare deep-dive — shown where caps.compare (GET /compare); hidden otherwise. -->
+  <div class="card" id="compareCard" style="display:none">
+    <h2>Meter compare</h2>
+    <div class="note" id="cmpSub">–</div>
+    <div class="metrics" style="display:flex;gap:10px;margin:8px 0">
+      <div class="metric"><div class="v" id="cmpBias">–</div><div class="l">mean bias</div></div>
+      <div class="metric"><div class="v" id="cmpRatio">–</div><div class="l">ratio</div></div>
+      <div class="metric"><div class="v" id="cmpN">–</div><div class="l">pairs</div></div>
+    </div>
+    <div class="note" id="cmpVerdict"></div>
+    <div class="note" style="margin-top:8px">error map — power × cadence</div>
+    <canvas id="cmpHeat" width="440" height="230" style="width:100%;max-width:440px"></canvas>
+    <div class="note">bias % by torque (N·m)</div>
+    <canvas id="cmpTorq" width="440" height="130" style="width:100%;max-width:440px"></canvas>
+    <div class="note">Bland–Altman — mean of A,B vs B−A</div>
+    <canvas id="cmpBa" width="440" height="160" style="width:100%;max-width:440px"></canvas>
+  </div>
+
   <div class="card"><h2>Log</h2><div id="log"></div></div>
 
-<script>
+<script type="module">
 "use strict";
+// The Bridge GATT byte layouts are GENERATED from ui-schema/bridge.json (code/scripts/gen_bridge.py);
+// see design/ui-schema-design.md. Importing them here is what actually locks this SPA to Proto.h —
+// the Node parity test + the C++ golden vectors assert the same schema, so an offset change can no
+// longer silently corrupt the primary control surface (architecture-remediation.md R2a).
+//   * served from GitHub Pages: bridge-codec.js is fetched as a sibling module.
+//   * served from a board (GET /app): web/gen_spa_header.py INLINES the module into WebSpa.h, so the
+//     firmware still ships exactly one self-contained file.
+//   * opening this file straight off disk (file://) no longer works — a module import needs http;
+//     use the Pages copy or the board's /app.
+import * as BC from "./bridge-codec.js";
 // The shared Bike Bridge SPA. Device I/O goes through a Transport; two implementations —
 // BleTransport (Web Bluetooth, GitHub Pages host) and HttpTransport (fetch, ESP32 host) — both
 // translate to/from the SAME normalized objects the view renders, so a UI change lands on both:
 //   Status {srcConnected,recording,srcW,outW,cad,bal,scale,offset,recN,uptime}
-//   Config {scale,offset,singleSided,srcFilter,outName}
+//   Config {scale,offset,singleSided,spoof,srcFilter,outName}   spoof=true => impersonate the Stages
+//          crank (drive an SB20); false => corrector (own identity). caps.antCapable gates the ANT+
+//          spoof-radio option (nRF only; ESP32 is BLE-only).
 //   Scan   [{name,rssi,isCps,isFtms,isCrank}]
 //   Cal    {state(0/1/2),pairs,minPairs,resid,coverage[6],enough}
 //   Wk     {loaded,running,paused,ergConnected,ergControlled,target,segIndex,nSeg,segRemain,elapsed,bias}
@@ -191,17 +248,25 @@
 const VER = 1;
 const PRESETS = ["4×8 Threshold", "Sweet Spot 3×12", "VO2 5×3", "Endurance 45"];
 const $ = id => document.getElementById(id);
+// Escape text bound for innerHTML. BLE-advertised device names are attacker-controlled (a nearby
+// device can advertise any name); interpolating one raw into innerHTML is DOM XSS, and since the
+// ESP32 serves this SPA same-origin at /app, that script would reach the board's own HTTP API.
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // ================= BleTransport (Web Bluetooth) =================
 const SVC = "53423230-0000-4bd9-a4ae-1b4e2c633a1d";
-const CH = { stat:"0001", cfg:"0002", rctl:"0003", rdat:"0004", curv:"0005", cal:"0006", scan:"0007", wk:"0008" };
+const CH = { stat:"0001", cfg:"0002", rctl:"0003", rdat:"0004", curv:"0005", cal:"0006", scan:"0007", wk:"0008", btn:"0009" };
 const uuid = s => `53423230-${s}-4bd9-a4ae-1b4e2c633a1d`;
 const dec = b => new TextDecoder().decode(b).replace(/\0+$/, "");
 
 class BleTransport {
   constructor() {
     this.kind = "ble"; this.autoConnect = false;
-    this.caps = { config:true, scan:true, calibration:true, workout:true, recording:true };
+    // antCapable: the nRF52840 (this transport's only device) is ANT-capable silicon, so the spoof
+    // radio can be BLE or ANT+ (ANT+ still gated on the S340 SoftDevice — the UI shows it disabled).
+    // compare:false — #10's deep-dive rides on GET /compare; exposing it as a BLE characteristic is
+    // the nRF follow-up. A capability, not a device-kind check (see the scalarCorrection note below).
+    this.caps = { config:true, scan:true, calibration:true, workout:true, recording:true, buttons:true, antCapable:true, scalarCorrection:true, compare:false };
     this.dev = null; this.ch = {}; this.dl = null;
     this.onStatus = this.onScan = this.onCal = this.onWk = this.onRec = this.onRecDone =
       this.onConn = this.onLog = () => {};
@@ -224,6 +289,7 @@ class BleTransport {
       catch (e) { this.ch[key] = null; this.onLog(`${key} not available (older firmware)`); }
     }
     try { await get("curv"); } catch (e) { this.ch.curv = null; }  // read/write, no notify
+    try { await get("btn"); } catch (e) { this.ch.btn = null; }    // SB20 buttons (read/write, no notify)
     if (this.ch.scan) { try { this.onScan(parseScan(await this.ch.scan.readValue())); } catch (e) {} }
     this.onConn(true, this.dev.name || "");
     this.onLog(`connected to ${this.dev.name}`);
@@ -242,20 +308,31 @@ class BleTransport {
     if (!this.ch.curv) return { hasCurve: false, breakpoints: [] };
     const d = await this.ch.curv.readValue();
     if (d.byteLength < 2 || d.getUint8(0) !== VER) return { hasCurve: false, breakpoints: [] };
-    const n = d.getUint8(1), bp = [];
-    for (let i = 0; i < n; i++) bp.push([d.getUint16(2 + i * 4, true), d.getUint16(4 + i * 4, true) / 1000]);
-    return { hasCurve: n > 0, breakpoints: bp };
+    const pts = BC.parseCurve(d).points;  // generated codec (ui-schema/bridge.json)
+    return { hasCurve: pts.length > 0, breakpoints: pts.map(p => [p.powerW, p.factor]) };
   }
   async setCurve(bp) {
     if (!this.ch.curv) throw new Error("this device has no curve characteristic");
-    const pts = bp.slice(0, 8);  // GATT cap is 8 points
-    const b = new Uint8Array(2 + pts.length * 4), v = new DataView(b.buffer);
-    b[0] = VER; b[1] = pts.length;
-    pts.forEach(([p, f], i) => {
-      v.setUint16(2 + i * 4, Math.max(0, Math.min(65535, Math.round(p))), true);
-      v.setUint16(4 + i * 4, Math.max(250, Math.min(4000, Math.round(f * 1000))), true);  // 0.25–4.0×
-    });
-    await this.ch.curv.writeValueWithResponse(b);
+    // Clamp here (product limits: power u16, factor 0.25–4.0×); the LAYOUT is the generated codec's.
+    const points = bp.slice(0, 8).map(([p, f]) => ({          // GATT cap is 8 points
+      powerW: Math.max(0, Math.min(65535, Math.round(p))),
+      factor: Math.max(0.25, Math.min(4.0, f)),
+    }));
+    await this.ch.curv.writeValueWithResponse(BC.packCurve({ points }));
+  }
+  // Buttons char (0x0009): [ver, enabled, act0..act5] — actN is an action-option INDEX (Sb20ButtonMap
+  // order; OBC_ACTIONS below mirrors it). The SB20-shifter -> action binding + sink enable.
+  async getButtons() {
+    if (!this.ch.btn) return { enabled: false, actions: [0, 0, 0, 0, 0, 0] };
+    const d = await this.ch.btn.readValue();
+    if (d.byteLength < 8 || d.getUint8(0) !== VER) return { enabled: false, actions: [0, 0, 0, 0, 0, 0] };
+    const b = BC.parseButtons(d);  // generated codec (ui-schema/bridge.json)
+    return { enabled: b.enabled, actions: b.act };
+  }
+  async setButtons(b) {
+    if (!this.ch.btn) throw new Error("this device has no buttons characteristic");
+    await this.ch.btn.writeValueWithResponse(BC.packButtons({ enabled: !!b.enabled, act: b.actions }));
+    return this.getButtons();
   }
   async scan() {}  // the bridge scans autonomously; ScanList pushes updates
   calStart(ref) { return this._wstr("cal", 1, ref); }
@@ -288,46 +365,48 @@ class BleTransport {
   }
 }
 // --- BLE byte <-> normalized parsers/packers ---
+// The byte layout lives in ONE place: ui-schema/bridge.json -> code/scripts/gen_bridge.py ->
+// bridge-codec.js (imported above) + the C++ golden vectors Proto.h is asserted against. These
+// functions are now pure NAME ADAPTERS: wire shape (srcPowerW, flags{}, entries[]) -> the view's
+// normalized shape (srcW, flat booleans, ...) documented at the top of this file. No offsets here —
+// an offset change in the schema regenerates the codec and can never silently miss the SPA (R2a).
 function parseStatus(d) {
-  const f = d.getUint8(1);
-  return { srcConnected: !!(f & 1), recording: !!(f & 4), srcW: d.getInt16(2, true), outW: d.getInt16(4, true),
-    cad: d.getInt16(6, true), bal: d.getInt8(8), scale: d.getUint16(10, true) / 1000, offset: d.getInt16(12, true) / 10,
-    recN: d.getUint32(14, true), uptime: d.getUint16(18, true) };
+  const s = BC.parseStatus(d);
+  return { srcConnected: s.flags.srcConnected, recording: s.flags.recording, srcW: s.srcPowerW, outW: s.outPowerW,
+    cad: s.cadenceRpm, bal: s.balancePct, scale: s.scale, offset: s.offset,
+    recN: s.recSamples, uptime: s.uptimeS };
 }
 function parseConfig(d) {
-  return { scale: d.getUint16(2, true) / 1000, offset: d.getInt16(4, true) / 10, singleSided: !!(d.getUint8(1) & 4),
-    srcFilter: dec(new Uint8Array(d.buffer, d.byteOffset + 6, 19)), outName: dec(new Uint8Array(d.buffer, d.byteOffset + 25, 19)) };
+  const c = BC.parseConfig(d);
+  return { scale: c.scale, offset: c.offset, singleSided: c.flags.singleSided, spoof: c.flags.spoof,
+    srcFilter: c.srcFilter, outName: c.outName };
 }
 function packConfig(c) {
-  const b = new Uint8Array(44), v = new DataView(b.buffer);
-  b[0] = VER; b[1] = c.singleSided ? 4 : 0;
-  v.setUint16(2, Math.round((c.scale || 1) * 1000), true);
-  v.setInt16(4, Math.round((c.offset || 0) * 10), true);
-  new TextEncoder().encodeInto((c.srcFilter || "").slice(0, 19), b.subarray(6, 25));
-  new TextEncoder().encodeInto((c.outName || "").slice(0, 19), b.subarray(25, 44));
-  return b;
+  // srcIsAnt/outIsAnt stay 0 — ANT routing is firmware-gated (rejected until the S340 build).
+  return BC.packConfig({ scale: c.scale || 1, offset: c.offset || 0,
+    flags: { srcIsAnt: false, outIsAnt: false, singleSided: !!c.singleSided, spoof: !!c.spoof },
+    srcFilter: (c.srcFilter || "").slice(0, 19), outName: (c.outName || "").slice(0, 19) });
 }
 function parseScan(d) {
-  const n = d.getUint8(1), out = [];
-  for (let i = 0; i < n; i++) {
-    const o = 2 + i * 21, f = d.getUint8(o + 20);
-    out.push({ name: dec(new Uint8Array(d.buffer, d.byteOffset + o, 19)), rssi: d.getInt8(o + 19),
-      isCps: !!(f & 1), isFtms: !!(f & 2), isCrank: !!(f & 4) });
-  }
-  return out;
+  return BC.parseScanList(d).entries.map(e => ({ name: e.name, rssi: e.rssi,
+    isCps: e.flags.isCps, isFtms: e.flags.isFtms, isCrank: e.flags.isStagesCrank }));
 }
 function parseCal(d) {
-  const cov = []; for (let i = 0; i < 6; i++) cov.push(d.getUint8(9 + i));
-  return { state: d.getUint8(1), pairs: d.getUint16(3, true), minPairs: d.getUint16(5, true),
-    resid: d.getInt16(7, true) / 10, coverage: cov, enough: !!d.getUint8(15) };
+  const c = BC.parseCalState(d);
+  return { state: c.state, pairs: c.pairCount, minPairs: c.minPairs,
+    resid: c.residual, coverage: c.coverage, enough: c.enoughToFit };
 }
 function parseWk(d) {
-  const f = d.getUint8(1);
-  return { loaded: !!(f & 1), running: !!(f & 2), paused: !!(f & 4), ergConnected: !!(f & 8), ergControlled: !!(f & 16),
-    target: d.getInt16(2, true), segIndex: d.getUint8(4), nSeg: d.getUint8(5), segRemain: d.getUint16(6, true),
-    elapsed: d.getUint16(10, true), bias: d.getInt16(12, true) };
+  const w = BC.parseWkState(d);
+  return { loaded: w.flags.loaded, running: w.flags.running, paused: w.flags.paused,
+    ergConnected: w.flags.ergConnected, ergControlled: w.flags.ergControlled,
+    target: w.targetW, segIndex: w.segIndex, nSeg: w.nSeg, segRemain: w.segRemainS,
+    elapsed: w.elapsedS, bias: w.biasW };
 }
-function parseRec(d) { return { state: d.getUint8(1), rate: d.getUint8(2), n: d.getUint32(4, true), capacity: d.getUint32(8, true) }; }
+function parseRec(d) {
+  const r = BC.parseRecState(d);
+  return { state: r.state, rate: r.rateHz, n: r.samples, capacity: r.capacity };
+}
 
 // IMU download assembly (BLE-only) -> {csv, mags, n, ok, rate}
 function crc32(bytes) {
@@ -357,7 +436,10 @@ function assembleImu(dl, devCrc) {
 class HttpTransport {
   constructor() {
     this.kind = "http"; this.autoConnect = true;
-    this.caps = { config:true, scan:true, calibration:true, workout:true, recording:false };
+    // antCapable:false — the ESP32 has no ANT radio, so spoof is BLE-only (no radio picker shown).
+    // scalarCorrection:false — the ESP32's correction is a fitted curve, not editable scale/offset, so
+    // the SPA hides the scalar inputs here (setConfig would otherwise silently drop them, WebJson.h:33).
+    this.caps = { config:true, scan:true, calibration:true, workout:true, recording:false, buttons:true, antCapable:false, scalarCorrection:false, compare:true };
     this.cfg = { scale: 1, offset: 0 }; this.timer = null;
     this.onStatus = this.onScan = this.onCal = this.onWk = this.onRec = this.onRecDone =
       this.onConn = this.onLog = () => {};
@@ -388,17 +470,31 @@ class HttpTransport {
   disconnect() { if (this.timer) clearInterval(this.timer); this.onConn(false, ""); }
   async getConfig() {
     const j = await this._get("/config");
-    this.cfg = { scale: j.scale, offset: j.offset, singleSided: !!j.single_sided, srcFilter: j.src_filter || "", outName: j.out_name || "" };
+    // mode "corrector" | "spoof" (default absent => spoof, the ESP32's default). The ESP32's
+    // correction is a fitted curve, so scale/offset report the 1.0/0 baseline (has_curve flags a fit).
+    this.cfg = { scale: j.scale, offset: j.offset, singleSided: !!j.single_sided, spoof: j.mode !== "corrector",
+      srcFilter: j.src_filter || "", outName: j.out_name || "" };
     return this.cfg;
   }
   async setConfig(c) {
-    await this._post("/config", JSON.stringify({ scale: c.scale, offset: c.offset, single_sided: c.singleSided, src_filter: c.srcFilter, out_name: c.outName }));
-    return this.getConfig();
+    // POST /config as urlencoded form fields (the ESP32 has no JSON parser). It persists + REBOOTS to
+    // apply the identity, so don't re-GET (the device is restarting) — return the intended config.
+    const body = new URLSearchParams({ single: c.singleSided ? "1" : "0", src_filter: c.srcFilter || "",
+      out_name: c.outName || "", mode: c.spoof ? "spoof" : "corrector" }).toString();
+    await this._post("/config", body);
+    this.cfg = { ...this.cfg, ...c };
+    return this.cfg;
   }
   // /curve: GET returns breakpoints; POST takes the compact "power:factor,.." form (the ESP32 parses
   // it with curveFromString — no JSON parser on-device). Same portable profile as the BLE Curve char.
   async getCurve() { try { const j = await this._get("/curve"); return { hasCurve: !!j.has_curve, breakpoints: j.curve || [] }; } catch (e) { return { hasCurve: false, breakpoints: [] }; } }
   setCurve(bp) { return this._post("/curve", bp.map(([p, f]) => `${(+p).toFixed(1)}:${(+f).toFixed(4)}`).join(",")); }
+  // /obc/buttons.json: {enabled, actions:[i0..i5]} — same action-option indices as the BLE Buttons char.
+  async getButtons() { try { const j = await this._get("/obc/buttons.json"); return { enabled: !!j.enabled, actions: (j.actions || [0,0,0,0,0,0]).slice(0, 6) }; } catch (e) { return { enabled: false, actions: [0,0,0,0,0,0] }; } }
+  setButtons(b) { return this._post("/obc/buttons.json", JSON.stringify({ enabled: !!b.enabled, actions: b.actions })); }
+  // /compare: the #10 A/B deep-dive payload (renderCompareJson) — summary + per-torque-band bias +
+  // the power×cadence grid + downsampled pairs. `simulated` flags a fabricated meter B.
+  compare() { return this._get("/compare"); }
   scan() { return this._post("/setup/scan"); }
   calStart(ref) { return this._post("/calibrate/start", "ref=" + encodeURIComponent(ref)); }
   calCancel() { return this._post("/calibrate/cancel"); }
@@ -428,12 +524,12 @@ async function pickTransport() {
 
 // ================= view =================
 let T = null;
-const log = m => { const d = $("log"); d.innerHTML = `<div>${new Date().toLocaleTimeString()} ${m}</div>` + d.innerHTML; };
+const log = m => { const d = $("log"); d.innerHTML = `<div>${new Date().toLocaleTimeString()} ${esc(m)}</div>` + d.innerHTML; };
 PRESETS.forEach((p, i) => { const o = document.createElement("option"); o.value = i; o.textContent = p; $("wkPreset").appendChild(o); });
 
 function setConnected(on) {
   $("connDot").classList.toggle("on", on);
-  ["btnApply","btnRec","btnStop","btnDownload","btnErase","btnCalStart","btnWkSetTrainer","btnWkLoad","btnWkStart","btnCurveExport","btnCurveImport"].forEach(id => $(id).disabled = !on);
+  ["btnApply","btnButtonsApply","btnRec","btnStop","btnDownload","btnErase","btnCalStart","btnWkSetTrainer","btnWkLoad","btnWkStart","btnCurveExport","btnCurveImport"].forEach(id => $(id).disabled = !on);
   if (!on) ["btnWkPause","btnWkStop","btnBiasDown","btnBiasUp"].forEach(id => $(id).disabled = true);
   $("btnDisconnect").disabled = !on; $("btnConnect").disabled = on;
   if (!on) $("devName").textContent = "";
@@ -456,7 +552,7 @@ function renderScan(list) {
     const kind = d.isFtms ? "trainer" : d.isCrank ? "crank" : "meter";
     const mk = target => {
       const r = document.createElement("button"); r.className = "net";
-      r.innerHTML = `<span class="nm">${d.name}</span><span class="lk">${kind}</span><span class="sig" title="${d.rssi} dBm">${d.rssi}</span>`;
+      r.innerHTML = `<span class="nm">${esc(d.name)}</span><span class="lk">${kind}</span><span class="sig" title="${esc(d.rssi)} dBm">${esc(d.rssi)}</span>`;
       r.onclick = () => { $(target).value = d.name; }; return r;
     };
     el.appendChild(mk("cfgSrc"));
@@ -518,15 +614,64 @@ function wire(t) {
   T = t;
   t.onStatus = renderStatus; t.onScan = renderScan; t.onCal = renderCal; t.onWk = renderWk;
   t.onRec = renderRec; t.onRecDone = onRecDone; t.onLog = log;
-  t.onConn = (on, name) => { setConnected(on); if (on) { $("devName").textContent = name; loadConfig(); refreshCurve(); } log(on ? "connected" : "disconnected"); };
+  t.onConn = (on, name) => { setConnected(on); if (on) { $("devName").textContent = name; loadConfig(); refreshCurve(); loadButtons(); } log(on ? "connected" : "disconnected"); };
   if (!t.caps.recording) $("recCard").style.display = "none";
+  if (!t.caps.buttons) $("buttonsCard").style.display = "none";
+  if (t.caps.compare) $("compareCard").style.display = "";
+  // Scalar scale/offset is real on the nRF (packConfig writes it) but a no-op on the ESP32 (curve-only);
+  // hide the inputs where they'd be silently dropped, and point at the curve instead.
+  const scalar = t.caps.scalarCorrection !== false;
+  $("cfgScalarRow").style.display = scalar ? "" : "none";
+  $("cfgCurveNote").style.display = scalar ? "none" : "";
   if (t.kind === "ble" && !navigator.bluetooth) $("unsupported").style.display = "block";
 }
+// Broadcast-mode (spoof/corrector) UI. Spoof impersonates the Stages crank the SB20 expects, so its
+// advertised name is fixed to "Stages 62144" (editing it would stop the SB20 recognising us); corrector
+// broadcasts under our own editable name. The ANT+ spoof radio shows only on ANT-capable hardware
+// (the nRF) and stays disabled until the S340 SoftDevice lands — the ESP32 is BLE-only.
+const SPOOF_CRANK_NAME = "Stages 62144";
+let loadedSpoof = false, loadedOutName = "";
+function applyModeUi() {
+  const spoof = $("cfgMode").value === "spoof";
+  $("cfgModeHelp").textContent = spoof
+    ? "Impersonate the SB20's own Stages crank so the SB20 accepts our corrected power and runs erg — pair the SB20 to us as its crank."
+    : "Re-broadcast the corrected meter under our own name; any head unit (Garmin, Zwift) pairs to it. For meter-to-meter correction.";
+  $("cfgRadioRow").style.display = (spoof && T && T.caps.antCapable) ? "" : "none";
+  const out = $("cfgOut");
+  if (spoof) { out.value = SPOOF_CRANK_NAME; out.disabled = true; }
+  else { out.disabled = false; if (out.value === SPOOF_CRANK_NAME) out.value = loadedOutName || "SB20 Corrector"; }
+  $("cfgRebootHint").style.display = (spoof !== loadedSpoof) ? "" : "none";
+}
+$("cfgMode").onchange = applyModeUi;
 async function loadConfig() {
   try {
     const c = await T.getConfig();
     $("cfgScale").value = c.scale.toFixed(3); $("cfgOffset").value = c.offset.toFixed(1);
     $("cfgSingle").checked = !!c.singleSided; $("cfgSrc").value = c.srcFilter; $("cfgOut").value = c.outName;
+    $("cfgMode").value = c.spoof ? "spoof" : "corrector"; loadedSpoof = !!c.spoof; loadedOutName = c.outName || "";
+    applyModeUi();
+  } catch (e) {}
+}
+// ---- SB20 buttons: bind each handlebar button to an action ----
+// OBC_ACTIONS mirrors firmware/lib/proxy/Sb20ButtonMap.h sb20ActionOptions ORDER — the wire form is a
+// u8 index into this list, so the JS and firmware must agree byte-for-byte (index 0 = none).
+const OBC_ACTIONS = ["None", "OBC Shift Up", "OBC Shift Down", "OBC ERG Up", "OBC ERG Down", "OBC Lap",
+  "OBC Menu", "OBC Pause", "Erg target +10W (local)", "Erg target -10W (local)"];
+const SB20_BUTTONS = ["LEFT up", "LEFT down", "LEFT 3rd", "RIGHT up", "RIGHT down", "RIGHT 3rd"];
+function buildButtonRows() {
+  if ($("btnRows").children.length) return;  // once
+  const opts = OBC_ACTIONS.map((label, i) => `<option value="${i}">${label}</option>`).join("");
+  $("btnRows").innerHTML = SB20_BUTTONS.map((name, i) =>
+    `<label style="font-weight:600;font-size:.9rem">${name}</label>` +
+    `<select id="btnAct${i}" style="width:100%;margin:4px 0 10px">${opts}</select>`).join("");
+}
+async function loadButtons() {
+  if (!T.caps.buttons) return;
+  buildButtonRows();
+  try {
+    const b = await T.getButtons();
+    $("btnSink").checked = !!b.enabled;
+    for (let i = 0; i < 6; i++) $("btnAct" + i).value = String(b.actions[i] ?? 0);
   } catch (e) {}
 }
 // ---- Calibration profile (portable curve; format = the desk-tooling CalibrationProfile) ----
@@ -560,11 +705,28 @@ $("btnConnect").onclick = async () => { try { await T.connect(); } catch (e) { l
 $("btnDisconnect").onclick = () => T.disconnect();
 $("btnApply").onclick = async () => {
   try {
+    const spoof = $("cfgMode").value === "spoof";
+    const modeChanged = spoof !== loadedSpoof;
     const c = await T.setConfig({ scale: parseFloat($("cfgScale").value || "1"), offset: parseFloat($("cfgOffset").value || "0"),
-      singleSided: $("cfgSingle").checked, srcFilter: $("cfgSrc").value, outName: $("cfgOut").value });
+      singleSided: $("cfgSingle").checked, spoof, srcFilter: $("cfgSrc").value,
+      outName: spoof ? SPOOF_CRANK_NAME : $("cfgOut").value });
     $("cfgScale").value = c.scale.toFixed(3); $("cfgOffset").value = c.offset.toFixed(1); $("cfgSingle").checked = !!c.singleSided;
-    $("cfgSrc").value = c.srcFilter; $("cfgOut").value = c.outName; log("config applied");
+    $("cfgSrc").value = c.srcFilter; loadedSpoof = !!c.spoof; loadedOutName = c.spoof ? loadedOutName : c.outName;
+    $("cfgMode").value = c.spoof ? "spoof" : "corrector"; applyModeUi();
+    // Identity is set at boot on both platforms: the ESP32 persists + reboots; the nRF applies the
+    // framing live but needs a reboot to re-advertise the new identity/services.
+    log(T.kind === "http" ? "config saved — device restarting to apply"
+        : modeChanged ? `mode set to ${c.spoof ? "SPOOF (Stages crank)" : "CORRECTOR"} — reboot to re-advertise the identity`
+        : "config applied");
   } catch (e) { log(`config failed: ${e.message}`); }
+};
+$("btnButtonsApply").onclick = async () => {
+  try {
+    const actions = []; for (let i = 0; i < 6; i++) actions.push(parseInt($("btnAct" + i).value, 10) || 0);
+    const b = await T.setButtons({ enabled: $("btnSink").checked, actions });
+    if (b) { $("btnSink").checked = !!b.enabled; for (let i = 0; i < 6; i++) $("btnAct" + i).value = String(b.actions[i] ?? 0); }
+    log("button actions applied");
+  } catch (e) { log(`buttons failed: ${e.message}`); }
 };
 $("btnRec").onclick = async () => { await T.recSetRate(+$("recRate").value); await T.recStart(); };
 $("btnStop").onclick = () => T.recStop();
@@ -581,11 +743,108 @@ $("btnWkStop").onclick = () => T.wkStop();
 $("btnBiasDown").onclick = () => T.wkBias(-10);
 $("btnBiasUp").onclick = () => T.wkBias(10);
 
+// ---- #10 meter-compare deep dive (GET /compare — the device's renderCompareJson payload) ----
+// Three views over the same payload: the power×cadence error map (where the error lives), the
+// bias-by-torque slice (flat = scale error, ramp = torque-dependent), and Bland–Altman.
+const CMP_CAP = 15;                                  // colour/scale saturates at ±15% bias
+function cmpColor(pct) {
+  const t = Math.max(-1, Math.min(1, pct / CMP_CAP));
+  const dark = [0x26, 0x30, 0x4a], hot = t >= 0 ? [0xef, 0x44, 0x44] : [0x3b, 0x82, 0xf6], a = Math.abs(t);
+  return `rgb(${dark.map((d, i) => Math.round(d + (hot[i] - d) * a)).join(",")})`;
+}
+function cmpDrawHeat(D) {
+  const cv = $("cmpHeat"), ctx = cv.getContext("2d"), g = D.grid, PAD = { l: 34, b: 22, t: 6, r: 6 };
+  const W = cv.width - PAD.l - PAD.r, H = cv.height - PAD.t - PAD.b, cw = W / g.C, ch = H / g.P;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  for (let pi = 0; pi < g.P; pi++) for (let ci = 0; ci < g.C; ci++) {
+    const v = g.bias[pi][ci];
+    ctx.fillStyle = v === null ? "#141a28" : cmpColor(v);
+    ctx.fillRect(PAD.l + ci * cw + 1, PAD.t + (g.P - 1 - pi) * ch + 1, cw - 2, ch - 2);
+  }
+  const pHi = g.P * g.pW, cLo = g.cLo, cHi = g.cLo + g.C * g.cW;   // 28 N·m iso-torque guide
+  ctx.strokeStyle = "rgba(255,255,255,.28)"; ctx.setLineDash([4, 3]); ctx.beginPath();
+  let first = true;
+  for (let cad = cLo; cad <= cHi; cad += 2) {
+    const p = 28 * cad * 0.10472; if (p > pHi) continue;
+    const x = PAD.l + ((cad - cLo) / (cHi - cLo)) * W, y = PAD.t + H - (p / pHi) * H;
+    first ? (ctx.moveTo(x, y), first = false) : ctx.lineTo(x, y);
+  }
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#8b93a7"; ctx.font = "10px sans-serif";
+  ctx.fillText("28 N·m", PAD.l + 4, PAD.t + 11);
+  ctx.fillText(cLo + " rpm", PAD.l, cv.height - 6); ctx.fillText(cHi + "", PAD.l + W - 18, cv.height - 6);
+  ctx.fillText(pHi + " W", 2, PAD.t + 8); ctx.fillText("0", 2, PAD.t + H);
+}
+function cmpDrawTorque(D) {
+  const cv = $("cmpTorq"), ctx = cv.getContext("2d"), N = D.tqBias.length;
+  const PAD = { l: 26, b: 16, t: 6, r: 6 }, W = cv.width - PAD.l - PAD.r, H = cv.height - PAD.t - PAD.b;
+  const mid = PAD.t + H / 2, bw = W / N;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = "#2a3142"; ctx.beginPath(); ctx.moveTo(PAD.l, mid); ctx.lineTo(PAD.l + W, mid); ctx.stroke();
+  ctx.fillStyle = "#8b93a7"; ctx.font = "10px sans-serif"; ctx.fillText("0%", 2, mid + 3);
+  D.tqBias.forEach((v, i) => {
+    if (v === null) return;
+    const h = Math.max(-1, Math.min(1, v / CMP_CAP)) * (H / 2), x = PAD.l + i * bw;
+    ctx.fillStyle = cmpColor(v);
+    h >= 0 ? ctx.fillRect(x + 1, mid - h, bw - 2, h) : ctx.fillRect(x + 1, mid, bw - 2, -h);
+  });
+  ctx.fillStyle = "#8b93a7";
+  ctx.fillText("0", PAD.l, cv.height - 4); ctx.fillText(N * D.tqBandNm + " N·m", PAD.l + W - 34, cv.height - 4);
+}
+function cmpDrawBa(D) {
+  const cv = $("cmpBa"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const pts = (D.pairs || []).map(([a, b]) => ({ x: (a + b) / 2, y: b - a }));
+  if (!pts.length) return;
+  const PAD = { l: 34, b: 16, t: 8, r: 8 }, W = cv.width - PAD.l - PAD.r, H = cv.height - PAD.t - PAD.b;
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const xLo = Math.min(...xs), xHi = Math.max(...xs);
+  const mean = ys.reduce((s, v) => s + v, 0) / ys.length;
+  const sd = Math.sqrt(ys.reduce((s, v) => s + (v - mean) ** 2, 0) / ys.length);
+  const yLo = Math.min(...ys, mean - 2 * sd), yHi = Math.max(...ys, mean + 2 * sd);
+  const X = v => PAD.l + ((v - xLo) / (xHi - xLo || 1)) * W, Y = v => PAD.t + H - ((v - yLo) / (yHi - yLo || 1)) * H;
+  const line = (v, c, dash, label) => {
+    ctx.strokeStyle = c; ctx.setLineDash(dash); ctx.beginPath();
+    ctx.moveTo(PAD.l, Y(v)); ctx.lineTo(PAD.l + W, Y(v)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c; ctx.font = "10px sans-serif"; ctx.fillText(label, PAD.l + W - 58, Y(v) - 3);
+  };
+  line(mean + 1.96 * sd, "#8b93a7", [4, 3], "+1.96 SD");
+  line(mean - 1.96 * sd, "#8b93a7", [4, 3], "−1.96 SD");
+  for (const p of pts) { ctx.fillStyle = "rgba(239,68,68,.55)"; ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 2, 0, 7); ctx.fill(); }
+  line(mean, "#ef4444", [], "bias " + mean.toFixed(1) + " W");
+  ctx.fillStyle = "#8b93a7"; ctx.font = "10px sans-serif";
+  ctx.fillText(Math.round(xLo) + " W", PAD.l, cv.height - 4);
+  ctx.fillText(Math.round(xHi) + " W", PAD.l + W - 30, cv.height - 4);
+}
+async function refreshCompare() {
+  if (document.hidden) return;   // a background tab doesn't need a 3 s poll of the device
+  try {
+    const D = await T.compare();
+    if (!D || !D.valid) { $("cmpSub").textContent = "waiting for both meters…"; return; }
+    $("cmpSub").textContent = `${D.aName} (A, reference) vs ${D.bName} (B) · ${D.aW} W vs ${D.bW} W`;
+    $("cmpBias").textContent = (D.biasPct >= 0 ? "+" : "") + D.biasPct.toFixed(1) + "%";
+    $("cmpRatio").textContent = "×" + D.ratio.toFixed(3);
+    $("cmpN").textContent = D.nPairs;
+    const tq = D.tqBias.filter(v => v !== null);
+    const spread = tq.length > 1 ? tq[tq.length - 1] - tq[0] : 0;
+    // A fabricated B (the bench adapter sets B := A × ratio) is flat across torque BY CONSTRUCTION,
+    // so a verdict here would only restate the knob. Whether the real SB20's ~+11% is flat or ramps
+    // with torque is the OPEN question this view exists to answer — say that, don't fake an answer.
+    $("cmpVerdict").textContent = D.simulated
+      ? `Simulated meter B (B := A × ${D.ratio.toFixed(3)}). These are the bench adapter's own numbers restated, not a measurement — pair a real second meter for a verdict.`
+      : Math.abs(spread) > 3
+        ? `${D.bName} is NOT uniform: bias climbs ~${spread.toFixed(0)} points across torque — a torque-dependent error.`
+        : `${D.bName} is flat across torque (a clean scale error).`;
+    cmpDrawHeat(D); cmpDrawTorque(D); cmpDrawBa(D);
+  } catch (e) { /* device may not expose /compare */ }
+}
+
 // ================= boot =================
 (async () => {
   const t = await pickTransport();
   wire(t);
   if (t.autoConnect) { $("connectCard").style.display = "none"; try { await t.connect(); } catch (e) { log(`connect failed: ${e.message}`); } }
+  if (t.caps.compare) { refreshCompare(); setInterval(refreshCompare, 3000); }
 })();
 </script>
 </body>
